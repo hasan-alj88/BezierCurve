@@ -1,11 +1,12 @@
+import keras.layers
 import tensorflow as tf
 import numpy as np
-from tensorflow import keras
 from math import comb
 from itertools import product
 
 
-def bezier_curve_constant_matrix(order: int) -> tf.float64:
+@tf.function
+def bezier_curve_constant_matrix(order: int) -> tf.float32:
     """
     The Bezier curve constant matrix of oxo.
     where o is curve order ( number of Anchor points )
@@ -19,84 +20,80 @@ def bezier_curve_constant_matrix(order: int) -> tf.float64:
     c = tf.constant(c.T)
     c = tf.expand_dims(c, axis=2)
     c = tf.image.flip_left_right(c)
-    return tf.squeeze(c)
+    c = tf.squeeze(c)
+    return tf.expand_dims(c, axis=0)
 
 
-def power_series(t_values: tf.float64, order: int) -> tf.float64:
-    # t_mx1 -> t_mxo
-    powers = [tf.math.pow(t_values, n) for n in range(order)]
-    return tf.stack(powers, axis=1)
+def power_series(tensor: tf.float32, power: int):
+    t1 = tf.keras.layers.Lambda(lambda x: tf.expand_dims(x, axis=2))(tensor)
+    t0 = tf.ones_like(t1)
+    powers = [t0, t1]
+    for _ in range(1, power-1):
+        powers.append(tf.keras.layers.multiply([t1, powers[-1]]))
+    all_t = tf.keras.layers.Concatenate(axis=2)(powers)
+    return all_t
 
 
-def power_series_prime(t_values: tf.float64, order: int) -> tf.float64:
-    # t_mx1 -> t_mxo
-    powers = [n * tf.math.pow(t_values, n - 1) for n in range(order)]
-    return tf.stack(powers, axis=1)
+@tf.function
+def power_series_inv(tensor: tf.float32):
+    power = tensor.shape[1]
+    if order < 3:
+        tensor = tf.math.reduce_prod(tensor, axis=2)
+        tensor = tf.math.pow(tensor, 1.0/order)
+    else:
+        tensor = tf.math.reduce_sum(tensor, axis=2)
+        tensor = 1.0 / tensor
+        tensor = 1.0 - tensor
+    return tensor
 
 
-def magnitudes(vectors: tf.float64) -> tf.float64:
-    assert (len(vectors.shape) == 2)
-    v_sqr = tf.math.square(vectors)
-    v_sqr_sum = tf.math.reduce_sum(v_sqr, axis=1)
-    d = tf.math.sqrt(v_sqr_sum)
-    return d
+def triple_dot(x, b, c):
+    x = tf.keras.layers.Dot(axes=(2, 1))([x, b])
+    x = tf.keras.layers.Dot(axes=(2, 1))([x, c])
+    return x
 
 
-class BezierCurveInterpolationLayer(keras.layers.Layer):
-    def __init__(self, anchor: tf.float64):
-        super(BezierCurveInterpolationLayer, self).__init__()
-        self.order = anchor.shape[0]
-        # C_oxo
-        self.C = bezier_curve_constant_matrix(self.order)
-        # t_mx1
-        self.t = None
-        self.A = anchor
+def parameter_bazier_curve_model(anchors, data):
+    bc_order, dimension = anchors.shape
+    data_size = data.shape[0]
+    bc_c = bezier_curve_constant_matrix(bc_order)
+    bc_c_inv = tf.linalg.inv(bc_c)
+    p_inv = tf.linalg.pinv(anchors)
+    p_inv = tf.expand_dims(p_inv, axis=0)
+    a_in = tf.keras.Input(anchors.shape, batch_size=1, name='AnchorPoints')
+    b_in = tf.keras.Input(data.shape, batch_size=1, name='DataPoints')
 
-    def build(self, input_shape):
-        assert (input_shape[1] == self.A.shape[1])
-        self.t = self.add_weight(
-            shape=(input_shape[0],),
-            initializer="random_normal",
-            trainable=True,
-            dtype=tf.float64,
-            constraint=tf.keras.constraints.MinMaxNorm(
-                min_value=0.0,
-                max_value=1.0,
-            )
-        )
+    t_ps = triple_dot(b_in, p_inv, bc_c_inv)
+    t2 = tf.keras.layers.Lambda(lambda x: power_series_inv(x), name='PowerSeries_inv')(t_ps)
+    t_new = tf.keras.layers.Dense(data_size, activation='relu')(t2)
+    t_new = tf.keras.layers.Dropout(0.2)(t_new)
+    t_new = tf.keras.layers.Dense(data_size, activation='relu')(t_new)
+    get_t_new = tf.keras.Model(inputs=[a_in, b_in], outputs=[t_new])
 
-    def __call__(self, p: tf.float64):
-        """
-
-        :param p: points to be interpolated
-        :return: B_mxd = T_mxo C_oxo A_oxd
-        """
-        T = power_series(self.t, self.order)  # T_mxo
-        TC = tf.matmul(T, self.C)  # TC_mxo = T_mxo C_oxo
-        TCA = tf.matmul(TC, self.A)  # B_mxo = TCA_mxo = TC_mxo A_oxd
-        p = tf.cast(p, tf.float64)
-        error_vectors = TCA - p
-        error_distances = magnitudes(error_vectors)
-        mae_distances = tf.math.reduce_mean(error_distances)
-        self.add_loss(mae_distances)
-        return TCA
+    t_new_ps = power_series(t_new, bc_order)
+    b_new = triple_dot(t_new_ps, bc_c, a_in)
+    model = tf.keras.Model(inputs=[a_in, b_in], outputs=[b_new])
+    # model.build([a_in.shape, b_in.shape])
+    model.compile('adam', 'mse')
+    tf.keras.utils.plot_model(model, "model.png")
+    print(model.summary())
+    return get_t_new, model
 
 
-def bezier_curve_interpolation_model(anchors_, input_points):
-    assert (len(input_points.shape) == 2)
-    bcl = BezierCurveInterpolationLayer(anchors_)
-    bcl.build(input_points.shape)
-    x_in = tf.keras.Input(input_points.shape[1], batch_size=input_points.shape[0])
-    x_out = bcl(x_in)
-    return tf.keras.Model(x_in, x_out)
+order, data_size, dimension = 3, 10, 2
+b = np.random.random((data_size, dimension))
+a = np.random.random((order, dimension))
+parameter_bazier_curve_model(a, b)
 
 
-print(bezier_curve_constant_matrix(2))
-print(bezier_curve_constant_matrix(3))
 
-points = np.random.random((10, 2))
-anchors = np.array([[-1, 1], [0, 1], [1, 0]])
-model = bezier_curve_interpolation_model(anchors, points)
-model.build()
-model.compile(optimizer='sgd', loss='mse')
-print(model.summary())
+
+
+
+
+
+
+
+
+
+
